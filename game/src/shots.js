@@ -1,79 +1,108 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Screenshot staging for ?shot=start|play|chase|end&seed=N. Each scene is
+// built from the real game state (same world, traffic, peds and HUD the
+// player sees), posed deterministically, stepped a fixed number of frames
+// so motion blur of life — walking peds, rolling traffic — is in the frame,
+// then frozen. The renderer draws exactly what is staged here.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { roadCenter } from './world.js';
+import { makeCar } from './traffic.js';
+import { addHeat } from './police.js';
+import { dist } from './random.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
+// Ring the `count` closest entities around a point so a still looks alive.
+function placeNear(list, x, y, count, radius) {
+  // Nudge the `count` closest entities to ring the point so the frame is busy.
+  const sorted = [...list].sort((a, b) => dist(a.x, a.y, x, y) - dist(b.x, b.y, x, y));
+  for (let i = 0; i < Math.min(count, sorted.length); i++) {
+    const a = (i / Math.max(1, count)) * Math.PI * 2;
+    sorted[i].x = x + Math.cos(a) * radius * (0.6 + (i % 3) * 0.25);
+    sorted[i].y = y + Math.sin(a) * radius * (0.6 + (i % 3) * 0.25);
+    if (sorted[i].waypoint) sorted[i].waypoint = null;
   }
-  return Infinity;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
-}
+export function stageShot(game, scene) {
+  const { world, player } = game;
+  const cx = roadCenter(3);
+  const cy = roadCenter(4);
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  if (scene === 'start') {
+    game.state = 'title';
+    // Camera over a lively midtown intersection behind the title panel.
+    game.cam.x = cx - 640;
+    game.cam.y = cy - 400;
+    placeNear(game.peds, cx, cy, 8, 130);
+    placeNear(game.traffic, cx, cy, 5, 170);
+    return;
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (scene === 'play') {
+    game.state = 'play';
+    // Rico on foot at a busy intersection, first mission armed, peds and
+    // traffic all around, a parked car waiting to be stolen.
+    player.x = cx + 58;
+    player.y = cy + 62;
+    player.angle = -0.6;
+    game.cam.x = player.x - 640;
+    game.cam.y = player.y - 400;
+    placeNear(game.peds, player.x, player.y, 9, 150);
+    placeNear(game.traffic, cx, cy, 6, 190);
+    const parked = game.parked[0];
+    if (parked) { parked.x = player.x + 66; parked.y = player.y - 30; parked.angle = 0; }
+    return;
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (scene === 'chase') {
+    game.state = 'play';
+    // Rico fleeing down an avenue at speed, three cruisers on his tail,
+    // three stars on the HUD and the minimap lit up with police.
+    const car = game.parked[0] || game.traffic[0];
+    const ax = roadCenter(4);
+    player.car = car;
+    car.parked = false;
+    car.driver = true;
+    car.x = ax - 19;
+    car.y = roadCenter(5);
+    car.angle = -Math.PI / 2;
+    car.speed = 265;
+    car.axis = 'y';
+    car.dir = -1;
+    player.x = car.x;
+    player.y = car.y;
+    for (let i = 0; i < 3; i++) {
+      const cop = makeCar(ax + (i === 1 ? 19 : -19), car.y + 120 + i * 74, -Math.PI / 2, '#274690', 'police');
+      cop.health = 90;
+      cop.speed = 250;
+      cop.phase = i * 1.7;
+      game.police.push(cop);
+    }
+    addHeat(game.wanted, 34, game.time);
+    game.wanted.stars = 3;
+    placeNear(game.traffic, car.x, car.y - 260, 3, 130);
+    placeNear(game.peds, car.x + 90, car.y - 120, 4, 90);
+    game.cam.x = car.x - 640;
+    game.cam.y = car.y - 430;
+    return;
+  }
+
+  // 'end': the story-complete celebration frame at the garage — cash banked,
+  // toast on screen, Rico parked up outside Marisol's.
+  game.state = 'play';
+  const g = world.points.garage;
+  player.cash = 3800;
+  player.x = g.x - 30;
+  player.y = g.y + 66;
+  player.angle = -Math.PI / 2;
+  const car = game.parked[0];
+  if (car) { car.x = g.x + 44; car.y = g.y + 60; car.angle = 0.3; }
+  game.missions.done = true;
+  game.missions.index = game.missions.list.length;
+  game.missions.toast = {
+    title: 'STORY COMPLETE',
+    sub: 'You made your name in Palm Shores. Free roam — the city is yours.',
+    t: 999,
+  };
+  placeNear(game.peds, g.x, g.y, 7, 130);
+  game.cam.x = player.x - 640;
+  game.cam.y = player.y - 400;
 }
